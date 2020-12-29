@@ -49,34 +49,26 @@ long thrust = 0;
 static uint32_t runMQTBSequence_last;
 #endif
 
-TaskHandle_t Task1;
-
 rmt_obj_t* rmt_send = NULL;
 
-hw_timer_t * timer = NULL;
-
-HardwareSerial MySerial(1);
+HardwareSerial tlm_serial(1);
 
 #define LCD_I2C_ADDR 0x3C
-//SSD1306  display(LCD_I2C_ADDR, 21, 22);  // 21 and 22 are default pins
-//TwoWire lcd_i2c();
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
-uint8_t receivedBytes = 0;
 volatile bool requestTelemetry = false;
 bool printTelemetry = true;
-uint16_t dshotUserInputValue = 0;
-uint16_t dshotmin = 48;
-uint16_t dshotmax = 2047;
-uint16_t dshotidle = dshotmin + round(3.5*(dshotmax-dshotmin)/100); // 3.5%
-uint16_t dshot50 =   dshotmin + round(50*(dshotmax-dshotmin)/100); // 50%
-uint16_t dshot75 =   dshotmin + round(75*(dshotmax-dshotmin)/100); // 75%
-int16_t ESC_telemetrie[5]; // Temperature, Voltage, Current, used mAh, eRpM
+volatile uint16_t dshotUserInputValue = 0;
+constexpr uint32_t dshotmin = 48;
+constexpr uint32_t dshotmax = 2047;
+const uint32_t dshotidle = dshotmin + round(3.5*(dshotmax-dshotmin)/100); // 3.5%
+const uint32_t dshot50 =   dshotmin + round(50*(dshotmax-dshotmin)/100); // 50%
+const uint32_t dshot75 =   dshotmin + round(75*(dshotmax-dshotmin)/100); // 75%
 bool runMQTBSequence = false;
 
 uint32_t currentTime;
-uint8_t temperature = 0;
-uint8_t temperatureMax = 0;
+uint32_t temperature = 0;
+uint32_t temperatureMax = 0;
 float voltage = 0;
 float voltageMin = 99;
 uint32_t current = 0;
@@ -85,68 +77,80 @@ uint32_t erpm = 0;
 uint32_t erpmMax = 0;
 uint32_t rpm = 0;
 uint32_t rpmMAX = 0;
-uint32_t kv = 0;
-uint32_t kvMax = 0;
+int32_t kv = 0;
+int32_t kvMax = 0;
 
-void resetMaxMinValues(void);
+
+#define LCD_write_value(X, Y, VAL) \
+    do { \
+        display.setCursor(X, Y); display.println(VAL); \
+    } while(0);
+#define LCD_clear()     display.clearDisplay();
+#define LCD_display()   display.display();
+
+#define ERPM_TO_RPM(erpm) ((erpm) / (MOTOR_POLES / 2))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
+
 void dshotOutput(uint16_t value, bool telemetry);
 void receiveTelemtrie(void);
 void updateDisplay(void);
 
-void gotTouch8()
+void error_driver(const char * str)
+{
+    Serial.printf("ERR: %s\n", str);
+    LCD_clear();
+    LCD_write_value(10, 0, "!! ERROR !!");
+    LCD_write_value(0, 10, str);
+    LCD_display();
+    while(1)
+        ;
+}
+
+void gotTouch_stop(void)
 {
     dshotUserInputValue = 0;
-    runMQTBSequence = false;
-    printTelemetry = true;
-} // DIGITAL_CMD_MOTOR_STOP
-
-void gotTouch9()
-{
-    dshotUserInputValue = 247;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-} // 10%
-
-void gotTouch7()
-{
-    dshotUserInputValue = 447;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-} // 20%
-
-void gotTouch6()
-{
-    dshotUserInputValue = 1047;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-} // 50%
-
-void gotTouch5()
-{
-    dshotUserInputValue = 2047;
-    resetMaxMinValues();
-    runMQTBSequence = false;
-    printTelemetry = true;
-} // 100%
-
-void gotTouch4()
-{
-    temperatureMax = 0;
-    voltageMin = 99;
-    currentMax = 0;
-    erpmMax = 0;
-    rpmMAX = 0;
-    kvMax = 0;
     runMQTBSequence = false;
     printTelemetry = true;
 }
 
 void resetMaxMinValues(void)
 {
-    gotTouch4();
+    gotTouch_stop();
+    temperatureMax = 0;
+    voltageMin = 99;
+    currentMax = 0;
+    erpmMax = 0;
+    rpmMAX = 0;
+    kv = kvMax = 0;
+}
+
+void gotTouch_10(void) // 10%
+{
+    resetMaxMinValues();
+    dshotUserInputValue = 247;
+}
+
+void gotTouch_20(void) // 20%
+{
+    resetMaxMinValues();
+    dshotUserInputValue = 447;
+}
+
+void gotTouch_50(void) // 50%
+{
+    resetMaxMinValues();
+    dshotUserInputValue = 1047;
+}
+
+void gotTouch_100(void) // 100%
+{
+    resetMaxMinValues();
+    dshotUserInputValue = 2047;
+}
+
+void gotTouch_rst(void)
+{
+    resetMaxMinValues();
 }
 
 void IRAM_ATTR getTelemetry(void)
@@ -154,8 +158,9 @@ void IRAM_ATTR getTelemetry(void)
     requestTelemetry = true;
 }
 
-void startTelemetryTimer()
+void startTelemetryTimer(void)
 {
+    static hw_timer_t * timer;
     timer = timerBegin(0, 80, true); // timer_id = 0; divider=80; countUp = true;
     timerAttachInterrupt(timer, &getTelemetry, true); // edge = true
     timerAlarmWrite(timer, 20000, true);  //1000 = 1 ms
@@ -163,38 +168,28 @@ void startTelemetryTimer()
 }
 
 // Second core used to handle dshot packets
-void secondCoreTask( void * pvParameters )
+void secondCoreTask(void * pvParameters)
 {
-    while(1){
-
+    while (1) {
         dshotOutput(dshotUserInputValue, requestTelemetry);
-
         if (requestTelemetry) {
             requestTelemetry = false;
-            receivedBytes = 0;
         }
-
         delay(1);
-
     }
-}
-
-inline void lcdDrawString(uint32_t x, uint32_t y, char const * const str)
-{
-    display.setCursor(x, y);
-    display.println(str);
-}
-
-inline void lcdDrawString(uint32_t x, uint32_t y, const String &str)
-{
-    display.setCursor(x, y);
-    display.println(str);
 }
 
 void setup()
 {
+    char temp_str[16];
+
     Serial.begin(115200);
-    MySerial.begin(115200, SERIAL_8N1, 16, 17);
+    tlm_serial.begin(115200, SERIAL_8N1, 16, 17);
+
+    /* Initialize display */
+    display.begin(SSD1306_SWITCHCAPVCC, LCD_I2C_ADDR);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
 
 #if LOADCELL_ENABLED
     loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
@@ -202,21 +197,13 @@ void setup()
     loadcell.tare();
 #endif // LOADCELL_ENABLED
 
-    if ((rmt_send = rmtInit(5, true, RMT_MEM_64)) == NULL) {
-        Serial.println("init sender failed\n");
+    rmt_send = rmtInit(5, true, RMT_MEM_64);
+    if (rmt_send == NULL) {
+        error_driver("init sender failed");
     }
 
     float realTick = rmtSetTick(rmt_send, 12.5); // 12.5ns sample rate
     Serial.printf("rmt_send tick set to: %fns\n", realTick);
-
-    display.begin(SSD1306_SWITCHCAPVCC, LCD_I2C_ADDR);
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-
-    // Output disarm signal while esc initialises and do some display stuff.
-    uint8_t xbeep = random(15, 100);
-    uint8_t ybeep = random(15, 50);
-    uint8_t ibeep = 0;
 
     uint32_t start = millis(), now = start;
     while ((now - start) < 3500) {
@@ -225,46 +212,43 @@ void setup()
         dshotOutput(0, false);
         delay(1);
 
-        ibeep++;
-        if (ibeep == 100) {
-            ibeep = 0;
-            xbeep = random(15, 50);
-            ybeep = random(15, 50);
-        }
-
-        display.clearDisplay();
-        lcdDrawString(xbeep, ybeep, "beep");
+        LCD_clear();
+        display.setTextSize(1);
+        LCD_write_value(0, 0, "Initialising ESC...");
+        display.setTextSize(2);
         if (distance < 500) {
-            lcdDrawString(0, 0, "Initialising ESC... 4s");
+            LCD_write_value(30, 30, "4s");
         } else if (distance < 1500) {
-            lcdDrawString(0, 0, "Initialising ESC... 3s");
+            LCD_write_value(30, 30, "3s");
         } else if (distance < 2500) {
-            lcdDrawString(0, 0, "Initialising ESC... 2s");
+            LCD_write_value(30, 30, "2s");
         } else {
-            lcdDrawString(0, 0, "Initialising ESC... 1s");
+            LCD_write_value(30, 30, "1s");
         }
-        display.display();
+        LCD_display();
 
         now = millis();
     }
+    display.setTextSize(1);
 
-    touchAttachInterrupt(T4, gotTouch4, 40);
-    touchAttachInterrupt(T5, gotTouch5, 40);
-    touchAttachInterrupt(T6, gotTouch6, 40);
-    touchAttachInterrupt(T7, gotTouch7, 40);
-    touchAttachInterrupt(T8, gotTouch8, 40);
-    touchAttachInterrupt(T9, gotTouch9, 40);
+    touchAttachInterrupt(T4, gotTouch_rst, 40);
+    touchAttachInterrupt(T5, gotTouch_100, 40);
+    touchAttachInterrupt(T6, gotTouch_50, 40);
+    touchAttachInterrupt(T7, gotTouch_20, 40);
+    touchAttachInterrupt(T9, gotTouch_10, 40);
+    touchAttachInterrupt(T8, gotTouch_stop, 40);
 
     // Empty Rx Serial of garbage telemtry
-    while (MySerial.available())
-        MySerial.read();
+    while (0 <= tlm_serial.read());
 
-    requestTelemetry = true;
+    getTelemetry();
 
     BeginWebUpdate();
 
-    startTelemetryTimer(); // Timer used to request tlm continually in case ESC rcv bad packet
+    // Timer used to request tlm continually in case ESC rcv bad packet
+    startTelemetryTimer();
 
+    TaskHandle_t Task1;
     xTaskCreatePinnedToCore(secondCoreTask, "Task1", 10000, NULL, 1, &Task1, 0);
 
     Serial.print("Time (ms)");
@@ -279,18 +263,21 @@ void setup()
     Serial.print(",");
     Serial.println("Thrust (g)");
 
+    resetMaxMinValues();
+
+    LCD_clear();
 #ifdef MINIQUADTESTBENCH
     dshotUserInputValue = dshotidle;
     runMQTBSequence = true;
-    display.clearDisplay();
-    lcdDrawString(0, 0, "Running MQTB Sequence...");
-    display.display();
+    LCD_write_value(20, 10, "Running");
+    LCD_write_value(20, 20, " MQTB");
+    LCD_write_value(20, 30, "Sequence");
     runMQTBSequence_last = millis();
 #else // !MINIQUADTESTBENCH
-    display.clearDisplay();
-    lcdDrawString(0, 0, "READY!");
-    display.display();
+    runMQTBSequence = false;
+    LCD_write_value(20, 10, "READY");
 #endif // MINIQUADTESTBENCH
+    LCD_display();
 }
 
 void loop()
@@ -304,7 +291,7 @@ void loop()
 #endif // LOADCELL_ENABLED
 
     if (!requestTelemetry) {
-         receiveTelemtrie();
+        receiveTelemtrie();
     }
 
 #ifdef MINIQUADTESTBENCH
@@ -356,112 +343,107 @@ uint8_t get_crc8(uint8_t *Buf, uint8_t BufLen)
 
 void receiveTelemtrie(void)
 {
-    static uint8_t SerialBuf[10];
+    uint8_t SerialBuf[10];
+    if (tlm_serial.available() >= sizeof(SerialBuf)) { // transmission complete
 
-    if (MySerial.available()) {
-        SerialBuf[receivedBytes] = MySerial.read();
-        receivedBytes++;
-    }
+        for (uint_fast8_t iter = 0; iter < sizeof(SerialBuf); iter++)
+            SerialBuf[iter] = tlm_serial.read();
 
-    if (receivedBytes > 9) { // transmission complete
+        // get the 8 bit CRC
+        uint8_t crc8 = get_crc8(SerialBuf, (sizeof(SerialBuf) - 1));
 
-        uint8_t crc8 = get_crc8(SerialBuf, 9); // get the 8 bit CRC
+        getTelemetry();
 
-        if (crc8 != SerialBuf[9]) {
+        if (crc8 != SerialBuf[(sizeof(SerialBuf) - 1)]) {
             // Serial.println("CRC transmission failure");
 
             // Empty Rx Serial of garbage telemtry
-            while (MySerial.available())
-                MySerial.read();
-
-            requestTelemetry = true;
+            while (0 <= tlm_serial.read());
 
             return; // transmission failure
         }
 
         // compute the received values
-        ESC_telemetrie[0] = SerialBuf[0]; // temperature
-        ESC_telemetrie[1] = (SerialBuf[1]<<8)|SerialBuf[2]; // voltage
-        ESC_telemetrie[2] = (SerialBuf[3]<<8)|SerialBuf[4]; // Current
-        ESC_telemetrie[3] = (SerialBuf[5]<<8)|SerialBuf[6]; // used mA/h
-        ESC_telemetrie[4] = (SerialBuf[7]<<8)|SerialBuf[8]; // eRpM *100
-
-        requestTelemetry = true;
+        //  [0]     Temperature
+        //  [1,2]   Voltage
+        //  [3,4]   Current
+        //  [5,6]   used mAh
+        //  [7,8]   eRpM
+        uint8_t _temperature = SerialBuf[0];
+        uint32_t _voltage = ((uint16_t)SerialBuf[1] << 8) + SerialBuf[2];
+        _voltage /= 100;
+        uint32_t _current = ((uint16_t)SerialBuf[3] << 8) + SerialBuf[4];
+        //uint32_t _mah = ((uint16_t)SerialBuf[5] << 8) + SerialBuf[6];
+        uint32_t _erpm = ((uint16_t)SerialBuf[7] << 8) + SerialBuf[8];
+        _erpm *= 100;
 
         if (!runMQTBSequence) { // Do not update during MQTB sequence.  Slows serial output.
             updateDisplay();
         }
-
-//      Serial.println("Requested Telemetrie");
-//      Serial.print("Temperature (C): ");
-//      Serial.println(ESC_telemetrie[0]);
-//      Serial.print("Voltage (V): ");
-//      Serial.println(ESC_telemetrie[1] / 100.0);
-//      Serial.print("Current (mA): ");
-//      Serial.println(ESC_telemetrie[2] * 100);
-//      Serial.print("mA/h: ");
-//      Serial.println(ESC_telemetrie[3] * 10);
-//      Serial.print("eRPM : ");
-//      Serial.println(ESC_telemetrie[4] * 100);
-//      Serial.print("RPM : ");
-//      Serial.println(ESC_telemetrie[4] * 100 / 7.0);  // 7 = 14 magnet count / 2
-//      Serial.print("KV : ");
-//      Serial.println( (ESC_telemetrie[4] * 100 / 7.0) / (ESC_telemetrie[1] / 100.0) );  // 7 = 14 magnet count / 2
-//      Serial.println(" ");
-//      Serial.println(" ");
 
         if (printTelemetry) {
             Serial.print(millis());
             Serial.print(",");
             Serial.print(dshotUserInputValue);
             Serial.print(",");
-        //      Serial.print("Voltage (V): ");
-            Serial.print(ESC_telemetrie[1] / 100.0);
+            Serial.print(_voltage);
             Serial.print(",");
-        //      Serial.print("Current (A): ");
-            Serial.print(ESC_telemetrie[2] / 10.0);
+            Serial.print(_current / 10.0);
             Serial.print(",");
-        //      Serial.print("RPM : ");
-            Serial.print(ESC_telemetrie[4] * 100 / (MOTOR_POLES / 2));
+            Serial.print(ERPM_TO_RPM(_erpm));
             Serial.print(",");
             // Thrust
             Serial.println(thrust);
         }
 
-        temperature = 0.9*temperature + 0.1*ESC_telemetrie[0];
+        temperature = (9 * temperature) / 10 + (_temperature / 10);
         if (temperature > temperatureMax) {
             temperatureMax = temperature;
         }
 
-        voltage = 0.9*voltage + 0.1*(ESC_telemetrie[1] / 100.0);
+        voltage = (9 * voltage) / 10 + (_voltage / 10);
         if (voltage < voltageMin) {
             voltageMin = voltage;
         }
 
-        current = 0.9*current + 0.1*(ESC_telemetrie[2] * 100);
+        current = (9 * current) / 10 + (_current * 10);
         if (current > currentMax) {
             currentMax = current;
         }
 
-        erpm = 0.9*erpm + 0.1*(ESC_telemetrie[4] * 100);
+        erpm = (9 * erpm) / 10 + (_erpm / 10);
         if (erpm > erpmMax) {
             erpmMax = erpm;
         }
 
-        rpm = erpm / (MOTOR_POLES / 2);
-        if (rpm > rpmMAX) {
-            rpmMAX = rpm;
+        uint32_t _rpm = ERPM_TO_RPM(erpm);
+        if (_rpm > rpmMAX) {
+            rpmMAX = _rpm;
         }
 
-        if (rpm) {                  // Stops weird numbers :|
-            kv = rpm / voltage / ( (float(dshotUserInputValue) - dshotmin) / (dshotmax - dshotmin) );
-        } else {
-            kv = 0;
-        }
-        if (kv > kvMax) {
-            kvMax = kv;
+        if (_rpm && voltage && dshotUserInputValue) { // Stops weird numbers :|
+            kv = _rpm / voltage / ((float)(dshotUserInputValue - dshotmin) / (dshotmax - dshotmin));
+            if (kv > kvMax) {
+                kvMax = kv;
+            }
         }
 
+        rpm = _rpm;
+
+#if 0
+        Serial.print("TELE: ");
+        Serial.print(_temperature);
+        Serial.print("C, ");
+        Serial.print(_voltage);
+        Serial.print("V, ");
+        Serial.print(_current * 100);
+        Serial.print("mA, eRPM:");
+        Serial.print(_erpm);
+        Serial.print(", RPM:");
+        Serial.print(ERPM_TO_RPM(_erpm));
+        Serial.print(", KV:");
+        Serial.println(ERPM_TO_RPM(_erpm) / _voltage);
+#endif
     }
 }
 
@@ -469,6 +451,7 @@ void dshotOutput(uint16_t value, bool telemetry)
 {
     rmt_data_t dshotPacket[16];
     uint16_t packet;
+    uint_fast8_t size = ARRAY_SIZE(dshotPacket);
 
     // telemetry bit
     if (telemetry) {
@@ -480,8 +463,8 @@ void dshotOutput(uint16_t value, bool telemetry)
     // https://github.com/betaflight/betaflight/blob/09b52975fbd8f6fcccb22228745d1548b8c3daab/src/main/drivers/pwm_output.c#L523
     int csum = 0;
     int csum_data = packet;
-    for (int i = 0; i < 3; i++) {
-        csum ^=  csum_data;
+    for (uint_fast8_t i = 0; i < 3; i++) {
+        csum ^= csum_data;
         csum_data >>= 4;
     }
     csum &= 0xf;
@@ -492,47 +475,48 @@ void dshotOutput(uint16_t value, bool telemetry)
     // Bit length (total timing period) is 1.67 microseconds (T0H + T0L or T1H + T1L).
     // For a bit to be 1, the pulse width is 1250 nanoseconds (T1H – time the pulse is high for a bit value of ONE)
     // For a bit to be 0, the pulse width is 625 nanoseconds (T0H – time the pulse is high for a bit value of ZERO)
-    for (int i = 0; i < 16; i++) {
+    for (uint_fast8_t i = 0; i < size; i++) {
+        dshotPacket[i].level0 = 1;
+        dshotPacket[i].level1 = 0;
         if (packet & 0x8000) {
-              dshotPacket[i].level0 = 1;
-              dshotPacket[i].duration0 = 100;
-              dshotPacket[i].level1 = 0;
-              dshotPacket[i].duration1 = 34;
-          } else {
-              dshotPacket[i].level0 = 1;
-              dshotPacket[i].duration0 = 50;
-              dshotPacket[i].level1 = 0;
-              dshotPacket[i].duration1 = 84;
-          }
+            dshotPacket[i].duration0 = 100;
+            dshotPacket[i].duration1 = 34;
+        } else {
+            dshotPacket[i].duration0 = 50;
+            dshotPacket[i].duration1 = 84;
+        }
         packet <<= 1;
     }
 
-    rmtWrite(rmt_send, dshotPacket, 16);
+    rmtWrite(rmt_send, dshotPacket, size);
 }
 
 void updateDisplay(void)
 {
-    display.clearDisplay();
+    LCD_clear();
 
-    lcdDrawString(0,  0, "Dshot Packet");
-    lcdDrawString(0, 10, "Temp C");
-    lcdDrawString(0, 20, "Volt");
-    lcdDrawString(0, 30, "mA");
-    lcdDrawString(0, 40, "eRPM");
-    lcdDrawString(0, 50, "KV");
+#define OFFSET_1 45
+#define OFFSET_2 90
 
-    lcdDrawString(80, 10, String(temperature));
-    lcdDrawString(80, 20, String(voltage));
-    lcdDrawString(80, 30, String(current));
-    lcdDrawString(80, 40, String(erpm));
-    lcdDrawString(80, 50, String(kv));
+    LCD_write_value(0,  0, "Dshot Packet");
+    LCD_write_value(0, 10, "Temp C");
+    LCD_write_value(0, 20, "Volt");
+    LCD_write_value(0, 30, "mA");
+    LCD_write_value(0, 40, "eRPM");
+    LCD_write_value(0, 50, "KV");
 
-    lcdDrawString(128,  0, String(dshotUserInputValue));
-    lcdDrawString(128, 10, String(temperatureMax));
-    lcdDrawString(128, 20, String(voltageMin));
-    lcdDrawString(128, 30, String(currentMax));
-    lcdDrawString(128, 40, String(erpmMax));
-    lcdDrawString(128, 50, String(kvMax));
+    LCD_write_value(OFFSET_1, 10, temperature);
+    LCD_write_value(OFFSET_1, 20, voltage);
+    LCD_write_value(OFFSET_1, 30, current);
+    LCD_write_value(OFFSET_1, 40, erpm);
+    LCD_write_value(OFFSET_1, 50, kv);
 
-    display.display();
+    LCD_write_value(OFFSET_2,  0, dshotUserInputValue);
+    LCD_write_value(OFFSET_2, 10, temperatureMax);
+    LCD_write_value(OFFSET_2, 20, voltageMin);
+    LCD_write_value(OFFSET_2, 30, currentMax);
+    LCD_write_value(OFFSET_2, 40, erpmMax);
+    LCD_write_value(OFFSET_2, 50, kvMax);
+
+    LCD_display();
 }

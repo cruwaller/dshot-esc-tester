@@ -181,8 +181,6 @@ void secondCoreTask(void * pvParameters)
 
 void setup()
 {
-    char temp_str[16];
-
     Serial.begin(115200);
     tlm_serial.begin(115200, SERIAL_8N1, 16, 17);
 
@@ -216,14 +214,15 @@ void setup()
         display.setTextSize(1);
         LCD_write_value(0, 0, "Initialising ESC...");
         display.setTextSize(2);
+
         if (distance < 500) {
-            LCD_write_value(30, 30, "4s");
+            LCD_write_value(50, 30, "4s");
         } else if (distance < 1500) {
-            LCD_write_value(30, 30, "3s");
+            LCD_write_value(50, 30, "3s");
         } else if (distance < 2500) {
-            LCD_write_value(30, 30, "2s");
+            LCD_write_value(50, 30, "2s");
         } else {
-            LCD_write_value(30, 30, "1s");
+            LCD_write_value(50, 30, "1s");
         }
         LCD_display();
 
@@ -269,13 +268,13 @@ void setup()
 #ifdef MINIQUADTESTBENCH
     dshotUserInputValue = dshotidle;
     runMQTBSequence = true;
-    LCD_write_value(20, 10, "Running");
-    LCD_write_value(20, 20, " MQTB");
-    LCD_write_value(20, 30, "Sequence");
+    LCD_write_value(40, 20, "Running");
+    LCD_write_value(40, 30, " MQTB");
+    LCD_write_value(40, 40, "Sequence");
     runMQTBSequence_last = millis();
 #else // !MINIQUADTESTBENCH
     runMQTBSequence = false;
-    LCD_write_value(20, 10, "READY");
+    LCD_write_value(40, 30, "Starting");
 #endif // MINIQUADTESTBENCH
     LCD_display();
 }
@@ -370,7 +369,7 @@ void receiveTelemtrie(void)
         //  [5,6]   used mAh
         //  [7,8]   eRpM
         uint8_t _temperature = SerialBuf[0];
-        uint32_t _voltage = ((uint16_t)SerialBuf[1] << 8) + SerialBuf[2];
+        float _voltage = ((uint16_t)SerialBuf[1] << 8) + SerialBuf[2];
         _voltage /= 100;
         uint32_t _current = ((uint16_t)SerialBuf[3] << 8) + SerialBuf[4];
         //uint32_t _mah = ((uint16_t)SerialBuf[5] << 8) + SerialBuf[6];
@@ -401,7 +400,8 @@ void receiveTelemtrie(void)
             temperatureMax = temperature;
         }
 
-        voltage = (9 * voltage) / 10 + (_voltage / 10);
+        voltage *= 0.9;
+        voltage += (_voltage / 10);
         if (voltage < voltageMin) {
             voltageMin = voltage;
         }
